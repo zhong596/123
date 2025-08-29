@@ -10,6 +10,7 @@
 #include <relative_move/SetRelativeMove.h>
 #include <ar_pose/Track.h>
 #include <unistd.h> // 用于 sleep
+#include <std_srvs/Empty.h>
 using namespace std;
 
 struct Point {
@@ -49,19 +50,87 @@ typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> AC;
 class Interaction {
 public:
     Interaction();
+    ~Interaction();
     string voice_collect(); // 语音采集
     string voice_dictation(const char* filename); // 语音听写
     string voice_tts(const char* text); // 语音合成
     bool goto_nav(struct Point* point); // 导航到目标位置，返回是否成功
 private:
     ros::NodeHandle n;
+    ros::NodeHandle private_nh;
     ros::ServiceClient collect_client, dictation_client, tts_client;
+    ros::ServiceClient clear_costmaps_client;
+    AC* ac;
+    double nav_result_timeout_seconds;
+    double server_wait_timeout_seconds;
+    int max_nav_retries;
+    bool ensureActionServer();
+    void rebuildActionClient();
+    bool clearCostmaps();
 };
 
-Interaction::Interaction() {
+Interaction::Interaction() : private_nh("~"), ac(NULL) {
     collect_client = n.serviceClient<robot_audio::Collect>("voice_collect");
     dictation_client = n.serviceClient<robot_audio::robot_iat>("voice_iat");
     tts_client = n.serviceClient<robot_audio::robot_tts>("voice_tts");
+    clear_costmaps_client = n.serviceClient<std_srvs::Empty>("move_base/clear_costmaps");
+
+    private_nh.param("nav_result_timeout_seconds", nav_result_timeout_seconds, 60.0);
+    private_nh.param("server_wait_timeout_seconds", server_wait_timeout_seconds, 10.0);
+    private_nh.param("max_nav_retries", max_nav_retries, 2);
+
+    rebuildActionClient();
+    if (!ensureActionServer()) {
+        ROS_WARN("move_base action server not connected at startup.");
+    }
+}
+
+Interaction::~Interaction() {
+    if (ac) {
+        try { ac->cancelAllGoals(); } catch (...) {}
+        delete ac;
+        ac = NULL;
+    }
+}
+
+bool Interaction::ensureActionServer() {
+    if (ac == NULL) {
+        rebuildActionClient();
+    }
+    if (ac->isServerConnected()) {
+        return true;
+    }
+    ROS_INFO("Waiting for move_base action server to be available (%.1f s)...", server_wait_timeout_seconds);
+    if (ac->waitForServer(ros::Duration(server_wait_timeout_seconds))) {
+        return true;
+    }
+    ROS_WARN("move_base action server not available, rebuilding action client and retrying...");
+    rebuildActionClient();
+    return ac->waitForServer(ros::Duration(server_wait_timeout_seconds));
+}
+
+void Interaction::rebuildActionClient() {
+    if (ac) {
+        try { ac->cancelAllGoals(); } catch (...) {}
+        delete ac;
+    }
+    ac = new AC("move_base", true);
+}
+
+bool Interaction::clearCostmaps() {
+    std_srvs::Empty srv;
+    if (!clear_costmaps_client.exists()) {
+        clear_costmaps_client = n.serviceClient<std_srvs::Empty>("move_base/clear_costmaps");
+    }
+    if (!ros::service::waitForService("move_base/clear_costmaps", ros::Duration(1.0))) {
+        ROS_WARN("clear_costmaps service unavailable");
+        return false;
+    }
+    bool ok = clear_costmaps_client.call(srv);
+    if (!ok) {
+        ROS_WARN("clear_costmaps call failed");
+    }
+    return ok;
 }
 
 string Interaction::voice_collect() {
@@ -92,11 +161,11 @@ string Interaction::voice_tts(const char* text) {
 }
 
 bool Interaction::goto_nav(struct Point* point) {
-    AC* ac = new AC("move_base", true);
-    ROS_INFO("Waiting for action server to start.");
-    ac->waitForServer();
-    ROS_INFO("Action server started, sending goal.");
-    
+    if (!ensureActionServer()) {
+        ROS_ERROR("Navigation server not available");
+        return false;
+    }
+
     move_base_msgs::MoveBaseGoal goal;
     goal.target_pose.header.frame_id = "map";
     goal.target_pose.header.stamp = ros::Time::now();
@@ -104,16 +173,47 @@ bool Interaction::goto_nav(struct Point* point) {
     goal.target_pose.pose.position.y = point->y;
     goal.target_pose.pose.orientation.z = point->z;
     goal.target_pose.pose.orientation.w = point->w;
-    ac->sendGoal(goal);
-    ac->waitForResult();
-    bool success = (ac->getState() == actionlib::SimpleClientGoalState::SUCCEEDED);
-    if (success)
-        ROS_INFO("Goal succeeded!");
-    else
-        ROS_INFO("Goal failed!");
-    ac->cancelGoal();
-    delete ac;
-    return success;
+
+    int total_attempts = max_nav_retries + 1;
+    for (int attempt_index = 1; attempt_index <= total_attempts; ++attempt_index) {
+        if (!ac->isServerConnected() && !ensureActionServer()) {
+            ROS_ERROR("move_base action server still not available (attempt %d/%d)", attempt_index, total_attempts);
+            return false;
+        }
+
+        if (attempt_index > 1) {
+            ROS_WARN("Retrying navigation to %s (attempt %d/%d)", point->name.c_str(), attempt_index, total_attempts);
+        } else {
+            ROS_INFO("Sending navigation goal to %s", point->name.c_str());
+        }
+
+        ac->sendGoal(goal);
+        bool finished_before_timeout = ac->waitForResult(ros::Duration(nav_result_timeout_seconds));
+        actionlib::SimpleClientGoalState state = ac->getState();
+
+        if (finished_before_timeout && state == actionlib::SimpleClientGoalState::SUCCEEDED) {
+            ROS_INFO("Goal to %s succeeded", point->name.c_str());
+            return true;
+        }
+
+        if (!finished_before_timeout) {
+            ROS_WARN("Navigation to %s timed out after %.1f seconds", point->name.c_str(), nav_result_timeout_seconds);
+        } else {
+            ROS_WARN("Navigation to %s failed with state: %s", point->name.c_str(), state.toString().c_str());
+        }
+
+        ac->cancelAllGoals();
+        ros::Duration(0.5).sleep();
+
+        bool cleared = clearCostmaps();
+        if (cleared) {
+            ROS_INFO("Cleared costmaps before retry");
+        }
+        ros::Duration(0.5).sleep();
+    }
+
+    ROS_ERROR("All navigation attempts to %s failed", point->name.c_str());
+    return false;
 }
 
 int main(int argc, char **argv) {
